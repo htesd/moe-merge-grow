@@ -222,8 +222,11 @@ def main():
             # finished: keep weights + structure only, drop the (3x larger) resumable checkpoint
             if not args.no_final_ckpt:
                 final_path = os.path.join(args.out_dir, "final_model.pt")
-                torch.save({"model": model.state_dict(), "config": dataclasses.asdict(cfg),
-                            "step": step}, final_path + ".tmp")
+                params = {n for n, _ in model.named_parameters()}
+                sd = {k: (v.to(torch.bfloat16) if k in params else v)
+                      for k, v in model.state_dict().items()}  # bf16 weights, exact buffers
+                torch.save({"model": sd, "config": dataclasses.asdict(cfg), "step": step},
+                           final_path + ".tmp")
                 os.replace(final_path + ".tmp", final_path)
             if os.path.exists(ckpt_path):
                 os.remove(ckpt_path)

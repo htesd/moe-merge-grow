@@ -220,7 +220,7 @@ class MoETransformer(nn.Module):
         }
 
 
-def configure_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), eps=1e-8):
+def configure_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), eps=1e-8, fused=None):
     decay, no_decay = [], []
     for p in model.parameters():
         (decay if p.dim() >= 2 else no_decay).append(p)
@@ -228,4 +228,8 @@ def configure_optimizer(model, lr, weight_decay, betas=(0.9, 0.95), eps=1e-8):
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=eps, foreach=True)
+    if fused is None:
+        fused = all(p.is_cuda for p in decay + no_decay)
+    # fused AdamW updates in place; foreach materialises full-size temporaries at step time
+    impl = {"fused": True} if fused else {"foreach": True}
+    return torch.optim.AdamW(groups, lr=lr, betas=betas, eps=eps, **impl)
