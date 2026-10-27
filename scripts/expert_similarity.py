@@ -373,6 +373,8 @@ def main():
 
     top = []
     for i in torch.argsort(bv, descending=True)[:30].tolist():
+        if float(bv[i]) <= -8:  # no other unit to compare with
+            break
         j = int(bi[i])
         sv = float(same[i, j])
         top.append({"a": uname(q_units[i]), "b": uname(j), "soft_align": round(float(bv[i]), 4),
