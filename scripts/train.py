@@ -106,7 +106,7 @@ def main():
             print(f"{args.out_dir} already finished, skipping", flush=True)
             return
     torch.manual_seed(args.seed)
-    dev = torch.device("cuda")
+    dev = torch.device("cuda", torch.cuda.current_device())
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     total_mem = torch.cuda.get_device_properties(dev).total_memory
