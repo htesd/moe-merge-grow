@@ -17,26 +17,27 @@ def expert_forward(x, local, gate, weights):
     k = local.shape[1]
     n = w.shape[0]
     dev = x.device
-    flat_local = local.reshape(-1)
+    flat_local = local.reshape(-1)  # assignment a = t * k + j
     order = torch.argsort(flat_local, stable=True)
     sorted_local = flat_local[order]
     tok = torch.div(order, k, rounding_mode="floor")
     counts = torch.bincount(sorted_local, minlength=n)
     cap = int(counts.max())
     starts = torch.cumsum(counts, 0) - counts
-    # unique slot of every assignment in the flat padded buffer [n * cap]
-    flat_pos = sorted_local * cap + torch.arange(T * k, device=dev) - starts[sorted_local]
+    # row of every assignment in the flat padded buffer [n * cap], in sorted and in (t, j) order
+    pos_sorted = sorted_local * cap + torch.arange(T * k, device=dev) - starts[sorted_local]
+    pos = torch.empty_like(pos_sorted).index_copy_(0, order, pos_sorted)
 
     # index_select / index_copy only: their backward is index_add / index_select. Advanced
     # indexing with a shared padding row makes the backward serialise on duplicate indices.
     xs = x.to(w.dtype).index_select(0, tok)
-    xp = xs.new_zeros(n * cap, d).index_copy(0, flat_pos, xs).view(n, cap, d)
+    xp = xs.new_zeros(n * cap, d).index_copy(0, pos_sorted, xs).view(n, cap, d)
     g = torch.bmm(xp, w[:, 0].transpose(1, 2))
     u = torch.bmm(xp, w[:, 1].transpose(1, 2))
     yp = torch.bmm(F.silu(g) * u, w[:, 2])  # [n, cap, d]
-    y = yp.reshape(n * cap, d).index_select(0, flat_pos).float()
-    y = y * gate.reshape(-1)[order].unsqueeze(-1).float()
-    return torch.zeros(T, d, device=dev, dtype=torch.float32).index_add(0, tok, y)
+    y = yp.reshape(n * cap, d).index_select(0, pos).view(T, k, d)
+    # gate-weighted sum over the k choices as one batched matmul (no atomics, no fp32 copies)
+    return torch.bmm(gate.to(y.dtype).unsqueeze(1), y).squeeze(1).float()
 
 
 class MoELayer(nn.Module):
