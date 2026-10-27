@@ -98,6 +98,13 @@ def gb(x):
 def main():
     args = get_args()
     os.makedirs(args.out_dir, exist_ok=True)
+    done_path = os.path.join(args.out_dir, "summary.json")
+    if os.path.exists(done_path) and not args.max_steps:
+        with open(done_path) as f:
+            prev = json.load(f)
+        if prev.get("status") == "ok" and prev.get("steps_done", 0) >= prev.get("total_steps", 1):
+            print(f"{args.out_dir} already finished, skipping", flush=True)
+            return
     torch.manual_seed(args.seed)
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -207,7 +214,16 @@ def main():
         summary["final_usage"] = layer_usage(model)
         summary["steps_done"] = step
         summary["tokens_done"] = step * tokens_per_step
-        if not args.no_final_ckpt:
+        if step >= total_steps:
+            # finished: keep weights + structure only, drop the (3x larger) resumable checkpoint
+            if not args.no_final_ckpt:
+                final_path = os.path.join(args.out_dir, "final_model.pt")
+                torch.save({"model": model.state_dict(), "config": dataclasses.asdict(cfg),
+                            "step": step}, final_path + ".tmp")
+                os.replace(final_path + ".tmp", final_path)
+            if os.path.exists(ckpt_path):
+                os.remove(ckpt_path)
+        elif not args.no_final_ckpt:
             save_ckpt(ckpt_path, model, opt, step, data, args)
     except torch.cuda.OutOfMemoryError as e:
         status, err = "oom", str(e).splitlines()[0]

@@ -33,6 +33,7 @@ def main():
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--batch-docs", type=int, default=2048)
     ap.add_argument("--keep-parquet", action="store_true")
+    ap.add_argument("--download-dir", default="", help="where parquet files go (default <out>/_parquet)")
     args = ap.parse_args()
 
     import pyarrow.parquet as pq
@@ -62,7 +63,7 @@ def main():
             continue
         t0 = time.time()
         local = hf_hub_download(args.repo, name, repo_type="dataset",
-                                local_dir=os.path.join(args.out, "_parquet"))
+                                local_dir=args.download_dir or os.path.join(args.out, "_parquet"))
         pfile = pq.ParquetFile(local)
         val_left = args.val_docs if i == 0 else 0
         n_train = n_val = 0
