@@ -24,16 +24,18 @@ def expert_forward(x, local, gate, weights):
     counts = torch.bincount(sorted_local, minlength=n)
     cap = int(counts.max())
     starts = torch.cumsum(counts, 0) - counts
-    pos = torch.arange(T * k, device=dev) - starts[sorted_local]
-    pad_idx = torch.full((n, cap), T, dtype=torch.long, device=dev)
-    pad_idx[sorted_local, pos] = tok
+    # unique slot of every assignment in the flat padded buffer [n * cap]
+    flat_pos = sorted_local * cap + torch.arange(T * k, device=dev) - starts[sorted_local]
 
-    x_ext = torch.cat([x.to(w.dtype), x.new_zeros(1, d, dtype=w.dtype)], dim=0)
-    xp = x_ext[pad_idx]  # [n, cap, d]; padding rows point at the zero row
+    # index_select / index_copy only: their backward is index_add / index_select. Advanced
+    # indexing with a shared padding row makes the backward serialise on duplicate indices.
+    xs = x.to(w.dtype).index_select(0, tok)
+    xp = xs.new_zeros(n * cap, d).index_copy(0, flat_pos, xs).view(n, cap, d)
     g = torch.bmm(xp, w[:, 0].transpose(1, 2))
     u = torch.bmm(xp, w[:, 1].transpose(1, 2))
     yp = torch.bmm(F.silu(g) * u, w[:, 2])  # [n, cap, d]
-    y = yp[sorted_local, pos].float() * gate.reshape(-1)[order].unsqueeze(-1).float()
+    y = yp.reshape(n * cap, d).index_select(0, flat_pos).float()
+    y = y * gate.reshape(-1)[order].unsqueeze(-1).float()
     return torch.zeros(T, d, device=dev, dtype=torch.float32).index_add(0, tok, y)
 
 

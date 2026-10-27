@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .moe import MoELayer
 from .pool import ExpertPool
@@ -42,6 +43,25 @@ def rope_tables(seq_len, head_dim, theta):
     inv = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
     freqs = torch.outer(torch.arange(seq_len, dtype=torch.float32), inv)
     return freqs.cos(), freqs.sin()
+
+
+def _ce_sum(h, weight, targets):
+    return F.cross_entropy(F.linear(h, weight).float(), targets, reduction="sum")
+
+
+def chunked_cross_entropy(h, weight, targets, chunk):
+    """Mean CE without materialising all [tokens, vocab] logits: each chunk is recomputed
+    in backward, so peak logits memory is one chunk."""
+    h = h.reshape(-1, h.size(-1))
+    targets = targets.reshape(-1)
+    total = 0.0
+    for i in range(0, h.size(0), chunk):
+        args = (h[i : i + chunk], weight, targets[i : i + chunk])
+        if torch.is_grad_enabled():
+            total = total + checkpoint(_ce_sum, *args, use_reentrant=False)
+        else:
+            total = total + _ce_sum(*args)
+    return total / h.size(0)
 
 
 def apply_rope(x, cos, sin):
@@ -99,6 +119,8 @@ class MoETransformer(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
         self.compute_dtype = None  # e.g. torch.bfloat16 on GPU; None = parameter dtype
+        self.act_ckpt = False  # recompute each block in backward
+        self.ce_chunk = 2048  # tokens per cross-entropy chunk
 
         nn.init.normal_(self.embed.weight, std=cfg.init_std)
         for blk in self.blocks:
@@ -153,23 +175,28 @@ class MoETransformer(nn.Module):
             else:
                 m.rep_slot[ro] = new
 
+    def _block(self, blk, x, cos, sin):
+        x = x + blk.attn(blk.norm1(x), cos, sin)
+        y, lb, z = blk.moe(blk.norm2(x), self.pool, self.compute_dtype)
+        return x + y, lb, z
+
     def forward(self, idx, targets=None):
         B, L = idx.shape
         x = self.embed(idx)
         cos, sin = self.rope_cos[:L], self.rope_sin[:L]
         lb = z = 0.0
         for blk in self.blocks:
-            x = x + blk.attn(blk.norm1(x), cos, sin)
-            y, l, zz = blk.moe(blk.norm2(x), self.pool, self.compute_dtype)
-            x = x + y
+            if self.act_ckpt and torch.is_grad_enabled():
+                x, l, zz = checkpoint(self._block, blk, x, cos, sin, use_reentrant=False)
+            else:
+                x, l, zz = self._block(blk, x, cos, sin)
             lb = lb + l
             z = z + zz
-        logits = F.linear(self.norm_f(x), self.embed.weight)
+        h = self.norm_f(x)
         aux = {"lb": lb / len(self.blocks), "z": z / len(self.blocks)}
         if targets is None:
-            return logits, aux
-        loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), targets.reshape(-1))
-        return loss, aux
+            return F.linear(h, self.embed.weight), aux
+        return chunked_cross_entropy(h, self.embed.weight, targets, self.ce_chunk), aux
 
     def structure_stats(self):
         cfg = self.cfg

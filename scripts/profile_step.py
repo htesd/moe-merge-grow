@@ -24,6 +24,7 @@ def main():
     ap.add_argument("--d-ff", type=int, default=256)
     ap.add_argument("--top-k", type=int, default=8)
     ap.add_argument("--rows", type=int, default=25)
+    ap.add_argument("--act-ckpt", action="store_true")
     args = ap.parse_args()
 
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -31,6 +32,7 @@ def main():
                       experts_per_layer=args.experts_per_layer, top_k=args.top_k)
     model = MoETransformer(cfg).to(dev)
     model.compute_dtype = torch.bfloat16
+    model.act_ckpt = args.act_ckpt
     opt = configure_optimizer(model, 1e-3, 0.1)
     data = SyntheticData(cfg.vocab_size, cfg.seq_len, dev)
 

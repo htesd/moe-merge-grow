@@ -71,6 +71,28 @@ class ExpertForward(unittest.TestCase):
         torch.testing.assert_close(y, ref, atol=1e-5, rtol=1e-5)
 
 
+class MemorySavers(unittest.TestCase):
+    def test_chunked_ce_and_activation_checkpointing_match_plain(self):
+        m = tiny()
+        idx, tgt = batch()
+        logits, _ = m(idx)
+        ref = F.cross_entropy(logits.float().reshape(-1, VOCAB), tgt.reshape(-1))
+        ref.backward()
+        ref_grads = [p.grad.clone() if p.grad is not None else None for p in m.parameters()]
+        m.zero_grad(set_to_none=True)
+
+        m.ce_chunk = 7  # does not divide 3 * 16 tokens
+        m.act_ckpt = True
+        loss, _ = m(idx, tgt)
+        loss.backward()
+        self.assertAlmostEqual(loss.item(), ref.item(), places=5)
+        for p, g in zip(m.parameters(), ref_grads):
+            if g is None:
+                self.assertIsNone(p.grad)
+            else:
+                torch.testing.assert_close(p.grad, g, atol=1e-6, rtol=1e-5)
+
+
 class Alignment(unittest.TestCase):
     def test_transform_is_function_preserving_and_alignment_recovers_it(self):
         torch.manual_seed(1)

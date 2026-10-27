@@ -43,6 +43,8 @@ def get_args():
     g.add_argument("--lb-coef", type=float, default=0.01)
     g.add_argument("--z-coef", type=float, default=0.001)
     g.add_argument("--clip", type=float, default=1.0)
+    g.add_argument("--act-ckpt", action="store_true", help="recompute blocks in backward")
+    g.add_argument("--ce-chunk", type=int, default=2048, help="tokens per cross-entropy chunk")
     g = ap.add_argument_group("run")
     g.add_argument("--data-dir", default="")
     g.add_argument("--synthetic", action="store_true")
@@ -129,6 +131,8 @@ def main():
     try:
         model = MoETransformer(cfg).to(dev)
         model.compute_dtype = torch.bfloat16
+        model.act_ckpt = args.act_ckpt
+        model.ce_chunk = args.ce_chunk
         opt = configure_optimizer(model, args.lr, args.weight_decay)
         if args.synthetic:
             data = SyntheticData(args.vocab_size, args.seq_len, dev, seed=args.seed)
