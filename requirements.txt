@@ -1,0 +1,6 @@
+# torch (>= 2.4, CUDA build) is expected to come from the environment
+numpy
+scipy
+tiktoken
+pyarrow
+huggingface_hub
