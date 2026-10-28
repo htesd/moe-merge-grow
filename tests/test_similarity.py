@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 
+import numpy as np
 import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,7 +19,8 @@ except ImportError:  # pragma: no cover
 def make_checkpoint(path, d=32):
     """layer 0: dense MLP; layers 1-2: shared expert + 4 routed experts. Planted redundancy:
     L1.routed2 = exact copy of L1.routed1 (same index order),
-    L2.routed3 = L1.routed0 with permuted hidden units and rescaled / sign-flipped (up, down)."""
+    L2.routed3 = L1.routed0 with permuted hidden units and rescaled / sign-flipped (up, down),
+    gate row 0 of L2.routed0 = 2 * gate row 3 of L1.routed1 (up / down unrelated)."""
     g = torch.Generator().manual_seed(0)
 
     def ffn(f):
@@ -40,6 +42,7 @@ def make_checkpoint(path, d=32):
     perm = torch.randperm(8, generator=g)
     c = (torch.rand(8, generator=g) + 0.5) * torch.where(torch.rand(8, generator=g) < 0.5, -1.0, 1.0)
     experts[(2, 3)] = [gate[perm].clone(), up[perm] * c[:, None], down[:, perm] / c[None, :]]
+    experts[(2, 0)][0][0] = 2.0 * experts[(1, 1)][0][3]  # gate row only: a single-vector match
     for (l, e), w in experts.items():
         put(f"model.layers.{l}.mlp.experts.{e}.", w)
     t["model.layers.1.mlp.gate.weight"] = torch.randn(4, d, generator=g)  # router, must be ignored
@@ -61,6 +64,19 @@ class ExpertSimilarity(unittest.TestCase):
                            check=True, env=env, capture_output=True)
             with open(os.path.join(out, "result.json")) as f:
                 r = json.load(f)
+            t = dict(np.load(os.path.join(out, "layer_tables.npz")))
+        roles = list(t["roles"])
+        top = lambda h: int(h[..., -1].sum())  # best match in [0.99, 1.0]
+        # query layer 2 matched in layer 1: 8 permuted neurons in every role, plus one gate row
+        self.assertEqual(top(t["lm"][roles.index("triple"), 2, 1]), 8)
+        self.assertEqual(top(t["lm"][roles.index("gate"), 2, 1]), 9)
+        self.assertEqual(top(t["lm"][roles.index("up"), 2, 1]), 8)
+        self.assertEqual(top(t["lm"][roles.index("down"), 2, 1]), 8)
+        # the exact copy inside layer 1 shows up as same-layer, other-unit matches (16 neurons)
+        self.assertEqual(top(t["lm"][roles.index("triple"), 1, 1]), 16)
+        self.assertEqual(t["n_query"].tolist(), [16, 40, 40])
+        self.assertEqual(t["n_strong"].tolist(), [16, 40, 40])
+        self.assertLess(r["neuron_roles"]["gate"]["null_any"]["0.9"], 0.01)
         self.assertEqual(r["units"], 11)
         self.assertEqual(r["query_units"], 11)
         self.assertEqual(r["unit_kinds"], {"dense": 1, "shared": 2, "routed": 8})

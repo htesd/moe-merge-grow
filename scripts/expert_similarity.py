@@ -15,6 +15,13 @@ candidate layer and inside its own unit. Recorded per (query unit, candidate uni
 match ("soft alignment"), fraction of neurons matched above --cov-threshold ("coverage") and,
 for equal shapes, the same-index similarity, i.e. what an unaligned matrix comparison sees.
 A randomly rotated copy of some queries gives the chance level for the same candidate count.
+
+The same pass also matches each vector on its own, against all vectors of the same role:
+gate rows by cos (no symmetry: silu is not odd), up rows and down columns by |cos|. For every
+role (gate, up, down, triple) layer_tables.npz holds histograms of the best match per
+(query layer, candidate layer), inside the own unit, over other layers and anywhere, both for
+all query neurons and for "strong" ones only (|up|*|down| >= --weak-frac * model median), plus
+the rotated-query null per candidate layer.
 """
 
 import argparse
@@ -25,6 +32,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -34,6 +42,7 @@ THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 BINS = np.linspace(-0.4, 1.0, 141)
 NEG = -10.0
 KINDS = ("dense", "shared", "routed")
+ROLES = ("gate", "up", "down", "triple")
 
 _FFN = r"(?:mlp|block_sparse_moe|moe|feed_forward|ffn)"
 _PROJ = r"(gate_proj|up_proj|down_proj|w1|w2|w3)"
@@ -132,20 +141,43 @@ def discover_units(ckpt, hidden, n_layers):
     return layers
 
 
-def load_unit(ckpt, unit, dev, dt):
-    """Unit-normalised gate rows, up rows and down columns, each [f, d] in dtype dt."""
+def read_unit(ckpt, unit):
+    """Raw (gate [f, d], up [f, d], down [d, f]) tensors of a unit."""
     if "tensors" in unit:
-        g, u, w = unit["tensors"]
-    else:
-        g, u, w = (ckpt.get(unit["names"][k]) for k in ("gate", "up", "down"))
-    return [F.normalize(t.to(dev, torch.float32), dim=-1).to(dt) for t in (g, u, w.t())]
+        return unit["tensors"]
+    return tuple(ckpt.get(unit["names"][k]) for k in ("gate", "up", "down"))
 
 
-def sim_block(Ga, Ua, Wa, Gc, Uc, Wc):
-    s = Ga @ Gc.T
-    t = Ua @ Uc.T
-    t.addmm_(Wa, Wc.T)
-    return s.add_(t.abs_()).div_(3)
+def prep_unit(raw, dev, dt, norms=False):
+    """Unit-normalised gate rows, up rows and down columns, each [f, d] in dtype dt; with
+    norms=True also |up_i| * |down_i| per neuron (its output scale)."""
+    g, u, w = (t.to(dev, torch.float32) for t in raw)
+    w = w.t()
+    out = [F.normalize(t, dim=-1).to(dt) for t in (g, u, w)]
+    if norms:
+        out.append(u.norm(dim=-1) * w.norm(dim=-1))
+    return out
+
+
+def load_unit(ckpt, unit, dev, dt):
+    return prep_unit(read_unit(ckpt, unit), dev, dt)
+
+
+def role_blocks(Ga, Ua, Wa, Gc, Uc, Wc):
+    """Similarity blocks [gate cos, |up cos|, |down cos|, triple sim] between two neuron sets."""
+    sg = Ga @ Gc.T
+    su = Ua @ Uc.T
+    sw = Wa @ Wc.T
+    st = (su + sw).abs_().add_(sg).div_(3)
+    return [sg, su.abs_(), sw.abs_(), st]
+
+
+def frac_above(h, thresholds=THRESHOLDS):
+    """Fraction of histogram mass in bins at or above each threshold (bins are 0.01 wide)."""
+    h = np.asarray(h)
+    tot = h.sum(-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return {str(t): np.where(tot > 0, h[..., BINS[:-1] >= t - 1e-9].sum(-1) / tot, np.nan) for t in thresholds}
 
 
 def hist_summary(v):
@@ -168,9 +200,11 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--name", default="")
     ap.add_argument("--query-gb", type=float, default=24.0, help="memory for query neurons")
-    ap.add_argument("--chunk-elems", type=float, default=1.5e9, help="elements per similarity block")
+    ap.add_argument("--chunk-elems", type=float, default=1e9, help="elements per similarity block")
     ap.add_argument("--null-queries", type=int, default=4096)
     ap.add_argument("--cov-threshold", type=float, default=0.7)
+    ap.add_argument("--weak-frac", type=float, default=0.1,
+                    help="neurons with |up|*|down| below this fraction of the median count as weak")
     ap.add_argument("--max-layers", type=int, default=0, help="debug: only the first N FFN layers")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -218,16 +252,19 @@ def main():
 
     Gq = torch.empty(Q, d, dtype=dt, device=dev)
     Uq, Wq = torch.empty_like(Gq), torch.empty_like(Gq)
+    q_scale = torch.empty(Q, device=dev)
     q_unit = torch.empty(Q, dtype=torch.long)
     q_pos = torch.empty(Q, dtype=torch.long)
     o = 0
     for qi, gid in enumerate(q_units):
-        g, u, w = load_unit(ckpt, units[gid], dev, dt)
+        g, u, w, sc = prep_unit(read_unit(ckpt, units[gid]), dev, dt, norms=True)
         f = g.shape[0]
-        Gq[o : o + f], Uq[o : o + f], Wq[o : o + f] = g, u, w
+        Gq[o : o + f], Uq[o : o + f], Wq[o : o + f], q_scale[o : o + f] = g, u, w, sc
         q_unit[o : o + f], q_pos[o : o + f] = qi, torch.arange(f)
         o += f
     q_unit, q_pos = q_unit.to(dev), q_pos.to(dev)
+    scale_ref = float(q_scale.median())
+    q_strong = q_scale >= args.weak_frac * scale_ref
     q_layer = torch.tensor([lpos[units[g]["layer"]] for g in q_units], device=dev)[q_unit]
     q_f = torch.tensor([units[g]["f"] for g in q_units], device=dev)[q_unit]
     q_gid = torch.tensor(q_units, device=dev)[q_unit]
@@ -238,22 +275,31 @@ def main():
     R = torch.linalg.qr(torch.randn(d, d, generator=gen))[0].to(dev)
     Gn, Un, Wn = ((X[sel].float() @ R).to(dt) for X in (Gq, Uq, Wq))
 
-    best_by_layer = torch.full((Q, L), NEG, device=dev)
-    best_own = torch.full((Q,), NEG, device=dev)
-    null_best = torch.full((nq,), NEG, device=dev)
+    nR = len(ROLES)
+    best_by_layer_r = torch.full((nR, Q, L), NEG, device=dev)
+    best_own_r = torch.full((nR, Q), NEG, device=dev)
+    null_by_layer = torch.full((nR, nq, L), NEG, device=dev)
     pair_sum = torch.zeros(nQU, nU, device=dev)
     pair_cov = torch.zeros(nQU, nU, device=dev)
     same_sum = torch.zeros(nQU, nU, device=dev)
 
-    for l in layer_list:
+    def read_layer(l):
+        return [read_unit(ckpt, u) for u in layers[l]]
+
+    pool = ThreadPoolExecutor(max_workers=1)  # reads the next layer from disk while this one computes
+    pending = pool.submit(read_layer, layer_list[0])
+    for idx_l, l in enumerate(layer_list):
         li = lpos[l]
         lu = layers[l]
+        raw_units = pending.result()
+        if idx_l + 1 < L:
+            pending = pool.submit(read_layer, layer_list[idx_l + 1])
         C = sum(u["f"] for u in lu)
         Gc = torch.empty(C, d, dtype=dt, device=dev)
         Uc, Wc = torch.empty_like(Gc), torch.empty_like(Gc)
         start_of, groups, s0 = {}, [], 0  # groups: runs of consecutive units with the same f
-        for u in lu:
-            g, uu, w = load_unit(ckpt, u, dev, dt)
+        for u, raw in zip(lu, raw_units):
+            g, uu, w = prep_unit(raw, dev, dt)
             f = g.shape[0]
             Gc[s0 : s0 + f], Uc[s0 : s0 + f], Wc[s0 : s0 + f] = g, uu, w
             start_of[u["gid"]] = s0
@@ -262,15 +308,17 @@ def main():
             else:
                 groups.append((f, s0, [u["gid"]]))
             s0 += f
+        del raw_units
         chunk = max(128, int(args.chunk_elems // C))
 
         for a in range(0, nq, chunk):
             b = min(nq, a + chunk)
-            null_best[a:b] = torch.maximum(null_best[a:b], sim_block(Gn[a:b], Un[a:b], Wn[a:b], Gc, Uc, Wc).max(1).values.float())
+            for r, B in enumerate(role_blocks(Gn[a:b], Un[a:b], Wn[a:b], Gc, Uc, Wc)):
+                null_by_layer[r, a:b, li] = B.max(1).values.float()
 
         for a in range(0, Q, chunk):
             b = min(Q, a + chunk)
-            S = sim_block(Gq[a:b], Uq[a:b], Wq[a:b], Gc, Uc, Wc)
+            blocks = role_blocks(Gq[a:b], Uq[a:b], Wq[a:b], Gc, Uc, Wc)
             rows = (q_layer[a:b] == li).nonzero().flatten()
             if rows.numel():  # queries of this layer: score their own unit separately, then mask it
                 st = torch.tensor([start_of[g] for g in q_gid[a:b][rows].tolist()], device=dev)
@@ -278,11 +326,18 @@ def main():
                 ar_f = torch.arange(int(fr.max()), device=dev)
                 valid = ar_f[None, :] < fr[:, None]
                 cols = torch.where(valid, st[:, None] + ar_f[None, :], st[:, None])
-                own = S[rows[:, None], cols].float().masked_fill(~valid, NEG)
-                own[torch.arange(rows.numel(), device=dev), q_pos[a:b][rows]] = NEG  # self
-                best_own[a + rows] = own.max(1).values
-                S[rows[:, None], cols] = NEG
-            best_by_layer[a:b, li] = S.max(1).values.float()
+                ar_r = torch.arange(rows.numel(), device=dev)
+                for r, B in enumerate(blocks):
+                    own = B[rows[:, None], cols].float().masked_fill(~valid, NEG)
+                    own[ar_r, q_pos[a:b][rows]] = NEG  # self
+                    best_own_r[r, a + rows] = own.max(1).values
+                    del own
+                    B[rows[:, None], cols] = NEG
+                del cols, valid
+            for r, B in enumerate(blocks):
+                best_by_layer_r[r, a:b, li] = B.max(1).values.float()
+            S = blocks[-1]
+            del blocks
             qu = q_unit[a:b]
             for f, g0, gids in groups:
                 n = len(gids)
@@ -298,6 +353,74 @@ def main():
             del S
         del Gc, Uc, Wc
         print(json.dumps({"layer": l, "candidates": C, "elapsed_s": round(time.time() - t0)}), flush=True)
+    pool.shutdown()
+
+    # ---------------- per-layer tables for every role ----------------
+    nb = len(BINS) - 1
+    lo, width = float(BINS[0]), float(BINS[1] - BINS[0])
+
+    def hist(vals, keys, nkeys, mask=None):
+        ok = vals > NEG + 1
+        if mask is not None:
+            ok &= mask
+        b = ((vals[ok].clamp(float(BINS[0]), float(BINS[-1]) - 1e-6) - lo) / width).long().clamp_(0, nb - 1)
+        return torch.bincount(keys[ok] * nb + b, minlength=nkeys * nb).view(nkeys, nb).cpu().numpy()
+
+    ar = torch.arange(Q, device=dev)
+    lm_keys = (q_layer[:, None] * L + torch.arange(L, device=dev)[None, :]).flatten()
+    lm_strong = q_strong[:, None].expand(Q, L).flatten()
+    tables = {k: [] for k in ("lm", "lm_strong", "own", "own_strong", "other", "other_strong", "any", "any_strong")}
+    for r in range(nR):
+        bbl = best_by_layer_r[r]
+        flat = bbl.flatten()
+        tables["lm"].append(hist(flat, lm_keys, L * L).reshape(L, L, nb))
+        tables["lm_strong"].append(hist(flat, lm_keys, L * L, lm_strong).reshape(L, L, nb))
+        other = bbl.clone()
+        other[ar, q_layer] = NEG
+        other = other.max(1).values
+        anyb = torch.maximum(torch.maximum(other, bbl[ar, q_layer]), best_own_r[r])
+        for key, v in (("own", best_own_r[r]), ("other", other), ("any", anyb)):
+            tables[key].append(hist(v, q_layer, L))
+            tables[key + "_strong"].append(hist(v, q_layer, L, q_strong))
+        del other, anyb, flat
+    del lm_keys, lm_strong
+    tables = {k: np.stack(v) for k, v in tables.items()}
+    null_keys = torch.arange(L, device=dev)[None, :].expand(nq, L).flatten()
+    zeros_nq = torch.zeros(nq, dtype=torch.long, device=dev)
+    null_lm = np.stack([hist(null_by_layer[r].flatten(), null_keys, L) for r in range(nR)])
+    null_any = np.stack([hist(null_by_layer[r].max(1).values, zeros_nq, 1)[0] for r in range(nR)])
+    scale_bins = np.linspace(-3, 1, 41)  # log10(|up|*|down| / model median)
+    log_ratio = torch.log10(q_scale.clamp_min(1e-12) / scale_ref)
+    sb = ((log_ratio - scale_bins[0]) / 0.1).long().clamp_(0, len(scale_bins) - 2)
+    scale_hist = torch.bincount(q_layer * 40 + sb, minlength=L * 40).view(L, 40).cpu().numpy()
+    np.savez_compressed(
+        os.path.join(args.out, "layer_tables.npz"), roles=np.array(ROLES), bins=BINS, layers=np.array(layer_list),
+        n_query=torch.bincount(q_layer, minlength=L).cpu().numpy(),
+        n_strong=torch.bincount(q_layer[q_strong], minlength=L).cpu().numpy(),
+        scale_ref=scale_ref, weak_frac=args.weak_frac, scale_bins=scale_bins, scale_hist=scale_hist,
+        null_lm=null_lm, null_any=null_any, **tables)
+
+    def fr(h):
+        return {t: round(float(v), 5) for t, v in frac_above(h, (0.3, 0.5, 0.7, 0.9)).items()}
+
+    diag = np.arange(L)
+    role_summary = {}
+    for r, role in enumerate(ROLES):
+        role_summary[role] = {
+            "own_unit": fr(tables["own"][r].sum(0)),
+            "same_layer_other_units": fr(tables["lm"][r][diag, diag].sum(0)),
+            "other_layers": fr(tables["other"][r].sum(0)),
+            "any": fr(tables["any"][r].sum(0)),
+            "other_layers_strong": fr(tables["other_strong"][r].sum(0)),
+            "any_strong": fr(tables["any_strong"][r].sum(0)),
+            "null_single_layer": fr(null_lm[r].sum(0)),
+            "null_any": fr(null_any[r]),
+        }
+    strong_frac = round(float(q_strong.float().mean()), 5)
+
+    # the triple similarity feeds the unit-level statistics below
+    best_by_layer, best_own = best_by_layer_r[3], best_own_r[3]
+    null_best = null_by_layer[3].max(1).values
 
     # ---------------- reduce ----------------
     nan = float("nan")
@@ -387,7 +510,8 @@ def main():
         "unit_f": sorted({u["f"] for u in units}), "cov_threshold": args.cov_threshold,
         "bins": [float(BINS[0]), float(BINS[-1]), len(BINS) - 1],
         "neuron": neuron, "neuron_by_kind": by_kind, "layer_distance_profile": profile,
-        "unit": unit_stats, "top_pairs": top, "elapsed_s": round(time.time() - t0),
+        "unit": unit_stats, "top_pairs": top, "neuron_roles": role_summary,
+        "strong_frac": strong_frac, "weak_frac": args.weak_frac, "elapsed_s": round(time.time() - t0),
     }
     with open(os.path.join(args.out, "result.json"), "w") as f:
         json.dump(result, f)
@@ -395,7 +519,8 @@ def main():
                         soft_align=pair.cpu().numpy().astype(np.float16),
                         coverage=cov.cpu().numpy().astype(np.float16),
                         same_index=same.cpu().numpy().astype(np.float16))
-    slim = {k: v for k, v in result.items() if k not in ("neuron", "neuron_by_kind", "unit")}
+    slim = {k: v for k, v in result.items() if k not in ("neuron", "neuron_by_kind", "unit", "layer_distance_profile")}
+    slim["top_pairs"] = top[:10]
     slim["neuron_frac_above"] = {k: v.get("frac_above") for k, v in neuron.items()}
     slim["neuron_quantiles"] = {k: v.get("quantiles") for k, v in neuron.items()}
     slim["unit_frac_above"] = {s: {m: v[m].get("frac_above") for m in v} for s, v in unit_stats.items()}
