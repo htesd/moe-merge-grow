@@ -459,6 +459,23 @@ def apply_pairs(model, li, pairs, op, W, mass, func_cache, func_fn):
     return pred
 
 
+def obs_prune(model, calib_batches, frac, ridge=1e-4, compensate=True):
+    """Delete the globally cheapest `frac` of all expert hidden units (LS-OBS in the Fisher metric)
+    with least-squares compensation. Returns the per-layer deleted fractions."""
+    st, n_tok, _ = collect(model, calib_batches, 0)
+    lays = []
+    for li in range(model.cfg.n_layers):
+        W = layer_weights(model, li)
+        s = st[li]
+        lays.append({"W": W, "Wd": W[:, 2].double(), "P": s["P"], "Pinv": ridge_inverse(s["P"], ridge),
+                     "G": s["G"], "R": fisher_factor(s["G"])})
+    items = [neuron_rule("obs_fisher", L, None) for L in lays]
+    masks = select_global(items, frac)
+    apply_neuron_deletion(model, lays, masks, compensate, n_tok)
+    model.rebuild()
+    return [round(float(m.float().mean()), 4) for m in masks]
+
+
 # ---------------------------------------------------------------- driver
 
 
