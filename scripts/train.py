@@ -13,6 +13,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from functional_redundancy import deleted_nonzero, obs_prune, redundancy_probe, val_batches  # noqa: E402
 from mmg.data import SyntheticData, TokenData  # noqa: E402
 from mmg.model import ModelConfig, MoETransformer, configure_optimizer  # noqa: E402
 from mmg.probe import layer_usage  # noqa: E402
@@ -58,6 +59,15 @@ def get_args():
     g.add_argument("--ckpt-interval", type=int, default=1000)
     g.add_argument("--no-final-ckpt", action="store_true")
     g.add_argument("--seed", type=int, default=0)
+    g = ap.add_argument_group("redundancy (see scripts/functional_redundancy.py)")
+    g.add_argument("--probe-at", default="", help="training fractions at which to measure prunability, e.g. 0.1,0.5,1")
+    g.add_argument("--probe-fracs", default="0.25,0.5,0.75", help="deleted fractions of expert hidden units")
+    g.add_argument("--probe-eval-batches", type=int, default=64)
+    g.add_argument("--calib-batches", type=int, default=128)
+    g.add_argument("--calib-bs", type=int, default=8)
+    g.add_argument("--prune-at", type=float, default=0.0, help="training fraction at which to prune (0: never)")
+    g.add_argument("--prune-frac", type=float, default=0.5)
+    g.add_argument("--prune-mode", default="global", choices=("global", "layer", "expert"))
     return ap.parse_args()
 
 
@@ -160,6 +170,30 @@ def main():
 
         val_small = data.val_batches(args.micro_batch, args.eval_batches)
         log = open(os.path.join(args.out_dir, "log.jsonl"), "a")
+
+        probe_steps = {max(1, round(float(f) * total_steps)) for f in args.probe_at.split(",") if f}
+        prune_step = max(1, round(args.prune_at * total_steps)) if args.prune_at > 0 else -1
+        prune_masks = None
+        if (probe_steps or prune_step > 0) and args.synthetic:
+            raise ValueError("--probe-at / --prune-at need real validation data")
+        calib_b = probe_b = None
+
+        def redundancy_batches():
+            # calibration from the end of val.bin, evaluation from its start (no overlap)
+            nonlocal calib_b, probe_b
+            if calib_b is None:
+                span = args.calib_batches * args.calib_bs * (args.seq_len + 1)
+                calib_b, _ = val_batches(data.val, len(data.val) - span, args.calib_batches, args.calib_bs,
+                                         args.seq_len, dev)
+                probe_b, end = val_batches(data.val, 0, args.probe_eval_batches, args.micro_batch, args.seq_len, dev)
+                if end > len(data.val) - span:
+                    raise ValueError("calibration and probe evaluation tokens overlap")
+            return calib_b, probe_b
+
+        def write(rec):
+            log.write(json.dumps(rec) + "\n")
+            log.flush()
+            print(json.dumps(rec), flush=True)
         model.train()
         t0, steps_since = time.time(), 0
         t_start = time.time()
@@ -207,6 +241,28 @@ def main():
                 log.write(json.dumps(rec) + "\n")
                 log.flush()
                 print(json.dumps(rec), flush=True)
+            if step in probe_steps:
+                t_p = time.time()
+                cb, pb = redundancy_batches()
+                fracs = [float(q) for q in args.probe_fracs.split(",") if q]
+                res = redundancy_probe(model, cb, pb, fracs)
+                write({"step": step, "tokens": step * tokens_per_step, "probe": res,
+                       "probe_seconds": round(time.time() - t_p)})
+                t0 += time.time() - t_p  # keep tok/s about training only
+            if step == prune_step:
+                t_p = time.time()
+                cb, pb = redundancy_batches()
+                before = evaluate(model, pb)
+                res = obs_prune(model, cb, args.prune_frac, opt=opt, mode=args.prune_mode)
+                prune_masks = res["masks"]
+                after = evaluate(model, pb)
+                summary["pruned"] = {"step": step, "frac": args.prune_frac, "mode": args.prune_mode,
+                                     "per_layer": res["per_layer"]}
+                write({"step": step, "tokens": step * tokens_per_step, "prune": {
+                    "frac": args.prune_frac, "mode": args.prune_mode, "val_before": before, "val_after": after,
+                    "pred_delta": res["pred_delta"], "per_layer": res["per_layer"]},
+                    "prune_seconds": round(time.time() - t_p)})
+                t0 += time.time() - t_p
             if args.ckpt_interval and step % args.ckpt_interval == 0 and step < run_steps:
                 save_ckpt(ckpt_path, model, opt, step, data, args)
 
@@ -218,6 +274,8 @@ def main():
         summary["final_usage"] = layer_usage(model)
         summary["steps_done"] = step
         summary["tokens_done"] = step * tokens_per_step
+        if prune_masks is not None:
+            summary["pruned"]["nonzero_left_in_deleted_units"] = deleted_nonzero(model, prune_masks)
         if step >= total_steps:
             # finished: keep weights + structure only, drop the (3x larger) resumable checkpoint
             if not args.no_final_ckpt:

@@ -99,7 +99,7 @@ def main():
             span = args.calib_batches * args.calib_bs * (seq + 1)
             calib, _ = val_batches(tokens, len(tokens) - span, args.calib_batches, args.calib_bs, seq, dev)
             rec["pruned_frac"] = float(frac)
-            rec["pruned_per_layer"] = obs_prune(model, calib, float(frac))
+            rec["pruned_per_layer"] = obs_prune(model, calib, float(frac))["per_layer"]
             del calib
         eval_b, _ = val_batches(tokens, 0, args.eval_batches, args.eval_bs, seq, dev)
         rec["val_loss"] = evaluate(model, eval_b)

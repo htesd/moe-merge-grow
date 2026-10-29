@@ -479,21 +479,82 @@ def apply_pairs(model, li, pairs, op, W, mass, func_cache, func_fn):
     return pred
 
 
-def obs_prune(model, calib_batches, frac, ridge=1e-4, compensate=True):
-    """Delete the globally cheapest `frac` of all expert hidden units (LS-OBS in the Fisher metric)
-    with least-squares compensation. Returns the per-layer deleted fractions."""
-    st, n_tok, _ = collect(model, calib_batches, 0)
+def _calibrated_layers(model, calib_batches, ridge):
+    """Calibration statistics per layer (activation checkpointing off: its recomputation would run
+    the hooks twice)."""
+    ckpt, model.act_ckpt = model.act_ckpt, False
+    try:
+        st, n_tok, _ = collect(model, calib_batches, 0)
+    finally:
+        model.act_ckpt = ckpt
     lays = []
     for li in range(model.cfg.n_layers):
         W = layer_weights(model, li)
         s = st[li]
         lays.append({"W": W, "Wd": W[:, 2].double(), "P": s["P"], "Pinv": ridge_inverse(s["P"], ridge),
                      "G": s["G"], "R": fisher_factor(s["G"])})
+    return lays, n_tok
+
+
+@torch.no_grad()
+def zero_deleted_state(model, opt, masks):
+    """Zero the AdamW moments of deleted hidden units. Their gate/up/down rows are zero, so their
+    gradients are exactly zero and, with zero moments, the units stay zero for the rest of training."""
+    if opt is None:
+        return
+    for li, D in enumerate(masks):
+        slots = model.blocks[li].moe._s["slots"]
+        for e in torch.nonzero(D.any(1)).flatten().tolist():
+            st = opt.state.get(model.pool.slots[slots[e]])
+            if st:
+                for key in ("exp_avg", "exp_avg_sq"):
+                    st[key][:, D[e]] = 0
+
+
+def deleted_nonzero(model, masks):
+    """Number of nonzero weights left in deleted hidden units (should stay 0)."""
+    n = 0
+    for li, D in enumerate(masks):
+        slots = model.blocks[li].moe._s["slots"]
+        for e in torch.nonzero(D.any(1)).flatten().tolist():
+            n += int((model.pool.slots[slots[e]][:, D[e]] != 0).sum())
+    return n
+
+
+def obs_prune(model, calib_batches, frac, ridge=1e-4, compensate=True, opt=None, mode="global"):
+    """Delete `frac` of all expert hidden units, cheapest first (LS-OBS in the Fisher metric), with
+    least-squares compensation of the down projections. With `opt`, the deleted units' AdamW moments
+    are zeroed so that training keeps them at zero. Returns per-layer fractions, masks, prediction."""
+    lays, n_tok = _calibrated_layers(model, calib_batches, ridge)
     items = [neuron_rule("obs_fisher", L, None) for L in lays]
-    masks = select_global(items, frac)
-    apply_neuron_deletion(model, lays, masks, compensate, n_tok)
+    masks = select_allocation(items, frac, mode)
+    pred = apply_neuron_deletion(model, lays, masks, compensate, n_tok)
     model.rebuild()
-    return [round(float(m.float().mean()), 4) for m in masks]
+    zero_deleted_state(model, opt, masks)
+    return {"per_layer": [round(float(m.float().mean()), 4) for m in masks], "masks": masks, "pred_delta": pred}
+
+
+def redundancy_probe(model, calib_batches, eval_batches, fracs, ridge=1e-4):
+    """Validation-loss increase after deleting each fraction in `fracs` of the expert hidden units
+    (global LS-OBS with compensation). The model is restored afterwards (the optimizer is untouched:
+    parameters are restored in place)."""
+    orig = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    try:
+        lays, n_tok = _calibrated_layers(model, calib_batches, ridge)
+        items = [neuron_rule("obs_fisher", L, None) for L in lays]
+        base = evaluate(model, eval_batches)
+        out = {"base_val_loss": base, "calib_tokens": n_tok, "fracs": {}}
+        for q in fracs:
+            masks = select_global(items, q)
+            pred = apply_neuron_deletion(model, lays, masks, True, n_tok)
+            model.rebuild()
+            v = evaluate(model, eval_batches)
+            out["fracs"][str(q)] = {"delta": v - base, "pred_delta": pred,
+                                    "per_layer": [round(float(m.float().mean()), 4) for m in masks]}
+            model.load_state_dict(orig)
+    finally:
+        model.load_state_dict(orig)
+    return out
 
 
 # ---------------------------------------------------------------- driver

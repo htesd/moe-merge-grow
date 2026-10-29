@@ -111,6 +111,49 @@ class FunctionalMerge(unittest.TestCase):
         torch.testing.assert_close((pk + pr)[:, None] * out(merged), target, rtol=1e-4, atol=1e-4)
 
 
+class PruneDuringTraining(unittest.TestCase):
+    def test_deleted_units_stay_zero_and_probe_restores(self):
+        from functional_redundancy import deleted_nonzero, obs_prune, redundancy_probe
+        from mmg.model import configure_optimizer
+
+        torch.manual_seed(0)
+        cfg = ModelConfig(vocab_size=64, seq_len=16, d_model=16, n_layers=2, n_heads=2, d_ff=8,
+                          experts_per_layer=4, top_k=2)
+        model = MoETransformer(cfg)
+        opt = configure_optimizer(model, 3e-3, 0.1)
+        g = torch.Generator().manual_seed(1)
+
+        def batch(n):
+            t = torch.randint(0, 64, (n, 17), generator=g)
+            return t[:, :-1], t[:, 1:]
+
+        def train(steps):
+            for _ in range(steps):
+                x, y = batch(4)
+                loss, aux = model(x, y)
+                (loss + 0.01 * aux["lb"]).backward()
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
+        train(5)  # nonzero AdamW moments everywhere
+        calib = [batch(4) for _ in range(4)]
+        ev = [batch(4) for _ in range(2)]
+        before = {k: v.clone() for k, v in model.state_dict().items()}
+        res = redundancy_probe(model, calib, ev, [0.25, 0.5])
+        self.assertEqual(set(res["fracs"]), {"0.25", "0.5"})
+        for k, v in model.state_dict().items():
+            self.assertTrue(torch.equal(v, before[k]), k)
+
+        out = obs_prune(model, calib, 0.5, opt=opt)
+        masks = out["masks"]
+        self.assertEqual(sum(int(m.sum()) for m in masks), 2 * 4 * 8 // 2)
+        self.assertEqual(deleted_nonzero(model, masks), 0)
+        kept = [p.detach().clone() for p in model.pool.slots]
+        train(5)
+        self.assertEqual(deleted_nonzero(model, masks), 0)
+        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(kept, model.pool.slots)))
+
+
 class ScriptSmoke(unittest.TestCase):
     def test_runs_on_cpu(self):
         cfg = ModelConfig(vocab_size=64, seq_len=32, d_model=32, n_layers=2, n_heads=2, d_ff=8,
