@@ -14,7 +14,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from functional_redundancy import (  # noqa: E402
-    fisher_factor, functional_merge, obs_eliminate, refit_after_removal, ridge_inverse,
+    fisher_factor, functional_merge, obs_eliminate, refit_after_removal, ridge_inverse, select_allocation,
 )
 from mmg.model import ModelConfig, MoETransformer  # noqa: E402
 
@@ -61,6 +61,28 @@ class LeastSquaresElimination(unittest.TestCase):
         self.assertAlmostEqual(cost, ref, delta=1e-6 * max(1.0, ref))
         torch.testing.assert_close(Bn[~D], beta, rtol=1e-6, atol=1e-8)
         self.assertEqual(float(Bn[D].abs().sum()), 0.0)
+
+
+class Allocation(unittest.TestCase):
+    def test_budget_split(self):
+        g = torch.Generator().manual_seed(2)
+        # layer 0 is much cheaper to prune than layer 1
+        items = [("score", torch.rand(4, 8, generator=g, dtype=torch.float64)),
+                 ("score", 10 + torch.rand(4, 8, generator=g, dtype=torch.float64))]
+        order = torch.stack([torch.randperm(8, generator=g) for _ in range(4)])
+        marg = torch.rand(4, 8, generator=g, dtype=torch.float64).cumsum(1)
+        prefix = [("prefix", order, marg), ("prefix", order, marg + 10)]
+        for its in (items, prefix):
+            glob = select_allocation(its, 0.5, "global")
+            self.assertEqual([int(m.sum()) for m in glob], [32, 0])
+            lay = select_allocation(its, 0.5, "layer")
+            self.assertEqual([int(m.sum()) for m in lay], [16, 16])
+            exp = select_allocation(its, 0.25, "expert")
+            for m in exp:
+                self.assertEqual(m.sum(1).tolist(), [2, 2, 2, 2])
+        exp = select_allocation(prefix, 0.25, "expert")[0]
+        for e in range(4):
+            self.assertEqual(sorted(exp[e].nonzero().flatten().tolist()), sorted(order[e, :2].tolist()))
 
 
 class FunctionalMerge(unittest.TestCase):

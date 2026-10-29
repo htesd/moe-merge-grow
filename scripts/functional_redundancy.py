@@ -287,6 +287,26 @@ def select_global(items, frac):
     return out
 
 
+def select_allocation(items, frac, mode):
+    """Deletion masks [E, f] per layer. mode: 'global' = cheapest units anywhere in the model,
+    'layer' = the same fraction in every layer, 'expert' = the same number in every expert."""
+    if mode == "global":
+        return select_global(items, frac)
+    if mode == "layer":
+        return [select_global([it], frac)[0] for it in items]
+    if mode != "expert":
+        raise ValueError(mode)
+    out = []
+    for it in items:
+        if it[0] == "score":
+            s = it[1]
+            idx = torch.argsort(s, dim=1, stable=True)[:, : int(round(frac * s.shape[1]))]
+        else:
+            idx = it[1][:, : int(round(frac * it[1].shape[1]))]
+        out.append(torch.zeros(idx.shape[0], it[1].shape[1], dtype=torch.bool, device=idx.device).scatter_(1, idx, True))
+    return out
+
+
 @torch.no_grad()
 def apply_neuron_deletion(model, lays, masks, compensate, n_tok):
     """Zero the gate/up rows of the deleted hidden units; set the down rows to the least-squares
